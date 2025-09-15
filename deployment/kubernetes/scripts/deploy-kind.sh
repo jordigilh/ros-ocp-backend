@@ -1,8 +1,15 @@
 #!/bin/bash
 
-# ROS-OCP Kubernetes Deployment Script for KIND
-# This script deploys the ROS-OCP Helm chart on a KIND cluster with proper storage and dependencies
+# ROS-OCP KIND Cluster Setup Script
+# This script sets up a KIND cluster for ROS-OCP deployment
+# For Helm chart deployment, use ./install-helm-chart.sh
 # Container Runtime: Docker (default)
+#
+# MEMORY REQUIREMENTS:
+# - Docker Desktop: Minimum 6GB memory allocation required
+# - KIND node: Fixed 6GB memory limit for deterministic deployment
+# - Allocatable: ~5.2GB after system reservations
+# - Full deployment: ~4.5GB for all ROS-OCP services
 
 set -e  # Exit on any error
 
@@ -16,9 +23,6 @@ NC='\033[0m' # No Color
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-ros-ocp-cluster}
-HELM_RELEASE_NAME=${HELM_RELEASE_NAME:-ros-ocp}
-NAMESPACE=${NAMESPACE:-ros-ocp}
-STORAGE_CLASS=${STORAGE_CLASS:-standard}
 
 echo_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -110,6 +114,27 @@ check_prerequisites() {
     export KIND_EXPERIMENTAL_PROVIDER=docker
     export DOCKER_CLI_EXPERIMENTAL=enabled
 
+    # Check Docker memory allocation
+    echo_info "Checking Docker memory allocation..."
+    local docker_memory=$(docker system info --format '{{.MemTotal}}' 2>/dev/null || echo "0")
+    if [ "$docker_memory" -gt 0 ]; then
+        local docker_memory_gb=$((docker_memory / 1024 / 1024 / 1024))
+        echo_info "Docker has ${docker_memory_gb}GB memory available"
+        if [ "$docker_memory_gb" -lt 5 ]; then
+            echo_warning "Docker has less than 5GB memory allocated."
+            echo_warning "This may cause deployment failures due to insufficient memory."
+            echo_warning "Recommended: Increase Docker memory to at least 6GB for reliable deployment."
+        elif [ "$docker_memory_gb" -lt 6 ]; then
+            echo_warning "Docker has ${docker_memory_gb}GB memory (recommended: 6GB+)."
+            echo_info "Deployment should work but may be slower than optimal."
+        else
+            echo_success "Docker memory allocation is sufficient (${docker_memory_gb}GB)"
+        fi
+    else
+        echo_warning "Could not determine Docker memory allocation."
+        echo_info "Please ensure Docker Desktop has at least 6GB memory allocated."
+    fi
+
     echo_success "All prerequisites are installed and Docker configured as default"
     return 0
 }
@@ -127,7 +152,7 @@ create_kind_cluster() {
         exit 1
     fi
 
-    # Create KIND cluster configuration with increased file descriptor limits
+    # Create KIND cluster configuration - using the most common approach
     local kind_config=$(cat <<EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -140,12 +165,6 @@ nodes:
     nodeRegistration:
       kubeletExtraArgs:
         node-labels: "ingress-ready=true"
-  - |
-    kind: KubeletConfiguration
-    maxPods: 250
-    systemReserved:
-      cpu: "0.5"
-      memory: "1Gi"
   extraPortMappings:
   - containerPort: 80
     hostPort: 80
@@ -153,56 +172,91 @@ nodes:
   - containerPort: 443
     hostPort: 443
     protocol: TCP
-  - containerPort: 30080
-    hostPort: 30080
-    protocol: TCP
-  - containerPort: 30081
-    hostPort: 30081
-    protocol: TCP
-  - containerPort: 30082
-    hostPort: 30082
-    protocol: TCP
-  - containerPort: 30090
-    hostPort: 30090
-    protocol: TCP
-  - containerPort: 30091
-    hostPort: 30091
-    protocol: TCP
-  - containerPort: 30099
-    hostPort: 30099
+  - containerPort: 8080
+    hostPort: 8080
     protocol: TCP
 EOF
 )
 
-    echo "$kind_config" | kind create cluster --config=-
+    # Create cluster with standard configuration
+    echo "$kind_config" | KIND_EXPERIMENTAL_DOCKER_NETWORK="" kind create cluster --config=-
 
-    if [ $? -eq 0 ]; then
-        echo_success "KIND cluster '$KIND_CLUSTER_NAME' created successfully"
-    else
+    if [ $? -ne 0 ]; then
         echo_error "Failed to create KIND cluster"
         return 1
+    fi
+    echo_success "KIND cluster '$KIND_CLUSTER_NAME' created successfully"
+
+    # Wait a moment for the container to fully initialize before applying memory constraints
+    echo_info "Waiting for KIND container to initialize..."
+    sleep 10
+
+    # Set memory limit on the KIND node container to 6GB for deterministic deployment
+    echo_info "Configuring KIND node with 6GB memory limit..."
+    if docker update --memory=6g "${KIND_CLUSTER_NAME}-control-plane" >/dev/null 2>&1; then
+        echo_success "Memory limit set to 6GB"
+        # Give the container a moment to adjust to the new memory limit
+        sleep 5
+    else
+        echo_warning "Could not set 6GB memory limit on KIND container."
+        echo_warning "This may cause deployment issues if Docker has insufficient memory."
+        echo_info "Continuing with default Docker memory allocation..."
+
+        # Check actual Docker memory available
+        local actual_memory=$(docker system info --format '{{.MemTotal}}' 2>/dev/null || echo "0")
+        if [ "$actual_memory" -gt 0 ]; then
+            local actual_gb=$((actual_memory / 1024 / 1024 / 1024))
+            echo_info "Docker has ${actual_gb}GB memory available"
+            if [ "$actual_gb" -lt 5 ]; then
+                echo_error "Docker has less than 5GB memory. Deployment may fail due to resource constraints."
+                echo_error "Please increase Docker memory allocation and try again."
+                return 1
+            fi
+        fi
     fi
 
     # Set kubectl context
     kubectl cluster-info --context "kind-${KIND_CLUSTER_NAME}"
     echo_success "kubectl context set to kind-${KIND_CLUSTER_NAME}"
 
-    # Wait for API server to be fully ready
+    # Wait for API server to be fully ready with extended timeout for 6GB constrained environment
     echo_info "Waiting for API server to be fully ready..."
-    local retries=30
+
+    # First check if the KIND container is running
+    if ! docker ps --filter "name=${KIND_CLUSTER_NAME}-control-plane" --filter "status=running" | grep -q "${KIND_CLUSTER_NAME}-control-plane"; then
+        echo_error "KIND container ${KIND_CLUSTER_NAME}-control-plane is not running"
+        docker ps --filter "name=${KIND_CLUSTER_NAME}-control-plane"
+        return 1
+    fi
+
+    local retries=60  # Increased to 5 minutes for memory-constrained environment
     local count=0
     while [ $count -lt $retries ]; do
         if kubectl get --raw /healthz >/dev/null 2>&1; then
             echo_success "API server is ready"
             break
         fi
-        echo_info "Waiting for API server... ($((count + 1))/$retries)"
+
+        # Show progress every 10 attempts (50 seconds)
+        if [ $((count % 10)) -eq 0 ] && [ $count -gt 0 ]; then
+            echo_info "Still waiting for API server... (${count}/${retries} - $((count * 5 / 60))m ${count * 5 % 60}s elapsed)"
+            # Show container status for debugging
+            echo_info "KIND container status: $(docker inspect --format='{{.State.Status}}' ${KIND_CLUSTER_NAME}-control-plane 2>/dev/null || echo 'unknown')"
+        else
+            echo_info "Waiting for API server... ($((count + 1))/$retries)"
+        fi
+
         sleep 5
         count=$((count + 1))
     done
 
     if [ $count -eq $retries ]; then
-        echo_error "API server not ready after $retries attempts"
+        echo_error "API server not ready after $retries attempts (5 minutes)"
+        echo_error "Debugging information:"
+        echo_info "KIND container status:"
+        docker ps --filter "name=${KIND_CLUSTER_NAME}-control-plane"
+        echo_info "KIND container logs (last 20 lines):"
+        docker logs --tail 20 "${KIND_CLUSTER_NAME}-control-plane" 2>/dev/null || echo "Could not retrieve container logs"
         return 1
     fi
 }
@@ -222,14 +276,10 @@ install_storage_provisioner() {
 install_ingress_controller() {
     echo_info "Installing NGINX Ingress Controller..."
 
-    # Install NGINX Ingress Controller for KIND (using older stable version)
+    # Install NGINX Ingress Controller for KIND (using stable version)
     kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/kind/deploy.yaml
 
-    # Wait additional time for API server to be fully stable
-    echo_info "Waiting for API server to be fully stable before ingress controller starts..."
-    sleep 30
-
-    # Wait for the deployment to be created before patching
+    # Wait for the deployment to be created
     echo_info "Waiting for ingress controller deployment to be created..."
     local retries=30
     local count=0
@@ -243,7 +293,7 @@ install_ingress_controller() {
         count=$((count + 1))
     done
 
-    # Wait for admission webhook job to complete (creates the certificate secret)
+    # Wait for admission webhook job to complete
     echo_info "Waiting for admission webhook setup to complete..."
     kubectl wait --namespace ingress-nginx \
         --for=condition=complete job/ingress-nginx-admission-create \
@@ -254,242 +304,73 @@ install_ingress_controller() {
         --for=condition=complete job/ingress-nginx-admission-patch \
         --timeout=60s || true
 
-    # Wait for the admission secret to be created
-    echo_info "Waiting for admission webhook secret..."
-    local retries=30
-    local count=0
-    while [ $count -lt $retries ]; do
-        if kubectl get secret ingress-nginx-admission -n ingress-nginx >/dev/null 2>&1; then
-            echo_success "Admission webhook secret found"
-            break
-        fi
-        echo_info "Waiting for admission secret... ($((count + 1))/$retries)"
-        sleep 2
-        count=$((count + 1))
-    done
-
-    # Enable debug logging in NGINX ingress controller
-    echo_info "Enabling debug logs in NGINX ingress controller..."
-    kubectl patch deployment ingress-nginx-controller -n ingress-nginx --type='json' -p='[
-        {
-            "op": "add",
-            "path": "/spec/template/spec/containers/0/args/-",
-            "value": "--v=2"
-        },
-        {
-            "op": "add",
-            "path": "/spec/template/spec/containers/0/args/-",
-            "value": "--logtostderr=true"
-        },
-        {
-            "op": "add",
-            "path": "/spec/template/spec/containers/0/env/-",
-            "value": {
-                "name": "NGINX_DEBUG",
-                "value": "true"
-            }
-        }
-    ]' || echo_warning "Debug logging patch failed, continuing..."
-
-    # Give time for the patch to take effect
-    sleep 5
-
     # Wait for ingress controller to be ready
     echo_info "Waiting for NGINX Ingress Controller to be ready..."
     kubectl wait --namespace ingress-nginx \
         --for=condition=ready pod \
         --selector=app.kubernetes.io/component=controller \
         --timeout=300s
+
+    echo_success "NGINX Ingress Controller is ready"
 }
 
-# Function to create namespace
-create_namespace() {
-    echo_info "Creating namespace: $NAMESPACE"
 
-    if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
-        echo_warning "Namespace '$NAMESPACE' already exists"
-    else
-        kubectl create namespace "$NAMESPACE"
-        echo_success "Namespace '$NAMESPACE' created"
-    fi
-}
 
-# Function to deploy Helm chart
-deploy_helm_chart() {
-    echo_info "Deploying ROS-OCP Helm chart..."
 
-    cd "$SCRIPT_DIR"
+# Note: Using localhost directly - no hostname setup required
 
-    # Check if Helm chart directory exists
-    if [ ! -d "../helm/ros-ocp" ]; then
-        echo_error "Helm chart directory not found: ../helm/ros-ocp"
-        return 1
-    fi
-
-    # Install or upgrade the Helm release
-    helm upgrade --install "$HELM_RELEASE_NAME" ../helm/ros-ocp \
-        --namespace "$NAMESPACE" \
-        --create-namespace \
-        --set global.storageClass="$STORAGE_CLASS" \
-        --timeout=600s \
-        --wait
-
-    if [ $? -eq 0 ]; then
-        echo_success "Helm chart deployed successfully"
-    else
-        echo_error "Failed to deploy Helm chart"
-        return 1
-    fi
-}
-
-# Function to wait for pods to be ready
-wait_for_pods() {
-    echo_info "Waiting for pods to be ready..."
-
-    # Wait for all pods to be ready (excluding jobs)
-    kubectl wait --for=condition=ready pod -l "app.kubernetes.io/instance=$HELM_RELEASE_NAME" \
-        --namespace "$NAMESPACE" \
-        --timeout=600s \
-        --field-selector=status.phase!=Succeeded
-
-    echo_success "All pods are ready"
-}
-
-# Function to create NodePort services for external access
-create_nodeport_services() {
-    echo_info "Creating NodePort services for external access..."
-
-    # Ingress service
-    kubectl patch service "${HELM_RELEASE_NAME}-ingress" -n "$NAMESPACE" \
-        -p '{"spec":{"type":"NodePort","ports":[{"port":3000,"nodePort":30080,"targetPort":"http","protocol":"TCP","name":"http"}]}}'
-
-    # ROS-OCP API service
-    kubectl patch service "${HELM_RELEASE_NAME}-rosocp-api" -n "$NAMESPACE" \
-        -p '{"spec":{"type":"NodePort","ports":[{"port":8000,"nodePort":30081,"targetPort":"http","protocol":"TCP","name":"http"},{"port":9000,"nodePort":30082,"targetPort":"metrics","protocol":"TCP","name":"metrics"}]}}'
-
-    # Kruize service
-    kubectl patch service "${HELM_RELEASE_NAME}-kruize" -n "$NAMESPACE" \
-        -p '{"spec":{"type":"NodePort","ports":[{"port":8080,"nodePort":30090,"targetPort":"http","protocol":"TCP","name":"http"}]}}'
-
-    # MinIO service (API and Console)
-    kubectl patch service "${HELM_RELEASE_NAME}-minio" -n "$NAMESPACE" \
-        --type='json' \
-        -p='[
-          {"op": "replace", "path": "/spec/type", "value": "NodePort"},
-          {"op": "add", "path": "/spec/ports/0/nodePort", "value": 30091},
-          {"op": "add", "path": "/spec/ports/1/nodePort", "value": 30099}
-        ]'
-
-    echo_success "NodePort services created"
-}
-
-# Function to show deployment status
+# Function to show cluster status
 show_status() {
-    echo_info "Deployment Status"
-    echo_info "=================="
+    echo_info "KIND Cluster Status"
+    echo_info "==================="
 
     echo_info "Cluster: kind-${KIND_CLUSTER_NAME}"
-    echo_info "Namespace: $NAMESPACE"
-    echo_info "Helm Release: $HELM_RELEASE_NAME"
+    echo_info "Context: $(kubectl config current-context)"
     echo ""
 
-    echo_info "Pods:"
-    kubectl get pods -n "$NAMESPACE" -o wide
+    echo_info "Cluster Info:"
+    kubectl cluster-info
     echo ""
 
-    echo_info "Services:"
-    kubectl get services -n "$NAMESPACE"
+    echo_info "Nodes:"
+    kubectl get nodes -o wide
     echo ""
 
-    echo_info "Storage:"
-    kubectl get pvc -n "$NAMESPACE"
+    echo_info "Storage Classes:"
+    kubectl get storageclass
     echo ""
 
-    echo_info "Access Points:"
-    echo_info "  - Ingress API: http://localhost:30080/api/ingress/v1/version"
-    echo_info "  - ROS-OCP API: http://localhost:30081/status"
-    echo_info "  - Kruize API: http://localhost:30090/listPerformanceProfiles"
-    echo_info "  - MinIO API: http://localhost:30091 (S3 API)"
-    echo_info "  - MinIO Console: http://localhost:30099 (Web UI - minioaccesskey/miniosecretkey)"
+    echo_info "Ingress Controller:"
+    kubectl get pods -n ingress-nginx
     echo ""
 
     echo_info "Useful Commands:"
-    echo_info "  - View logs: kubectl logs -n $NAMESPACE -l app.kubernetes.io/instance=$HELM_RELEASE_NAME"
-    echo_info "  - Port forward ingress: kubectl port-forward -n $NAMESPACE svc/${HELM_RELEASE_NAME}-ingress 3000:3000"
-    echo_info "  - Port forward API: kubectl port-forward -n $NAMESPACE svc/${HELM_RELEASE_NAME}-rosocp-api 8001:8000"
-    echo_info "  - Delete deployment: helm uninstall $HELM_RELEASE_NAME -n $NAMESPACE"
+    echo_info "  - Deploy Helm chart: ./install-helm-chart.sh"
+    echo_info "  - Test deployment: ./test-k8s-dataflow.sh"
     echo_info "  - Delete cluster: kind delete cluster --name $KIND_CLUSTER_NAME"
 }
 
-# Function to run health checks
-run_health_checks() {
-    echo_info "Running health checks..."
-
-    local failed_checks=0
-
-    # Check if ingress is accessible
-    if curl -f -s http://localhost:30080/api/ingress/v1/version >/dev/null; then
-        echo_success "Ingress API is accessible"
-    else
-        echo_error "Ingress API is not accessible"
-        failed_checks=$((failed_checks + 1))
-    fi
-
-    # Check if ROS-OCP API is accessible
-    if curl -f -s http://localhost:30081/status >/dev/null; then
-        echo_success "ROS-OCP API is accessible"
-    else
-        echo_error "ROS-OCP API is not accessible"
-        failed_checks=$((failed_checks + 1))
-    fi
-
-    # Check if Kruize is accessible
-    if curl -f -s http://localhost:30090/listPerformanceProfiles >/dev/null; then
-        echo_success "Kruize API is accessible"
-    else
-        echo_error "Kruize API is not accessible"
-        failed_checks=$((failed_checks + 1))
-    fi
-
-    # Check if MinIO console is accessible
-    if curl -f -s http://localhost:30099/ >/dev/null; then
-        echo_success "MinIO console is accessible"
-    else
-        echo_error "MinIO console is not accessible"
-        failed_checks=$((failed_checks + 1))
-    fi
-
-    if [ $failed_checks -eq 0 ]; then
-        echo_success "All health checks passed!"
-    else
-        echo_warning "$failed_checks health check(s) failed"
-    fi
-
-    return $failed_checks
-}
 
 # Function to cleanup
 cleanup() {
-    echo_info "Cleaning up..."
-
     if [ "${1:-}" = "--all" ]; then
         echo_info "Deleting KIND cluster..."
         kind delete cluster --name "$KIND_CLUSTER_NAME"
         echo_success "KIND cluster deleted"
     else
-        echo_info "Deleting Helm release..."
-        helm uninstall "$HELM_RELEASE_NAME" -n "$NAMESPACE" || true
-        echo_info "Deleting namespace..."
-        kubectl delete namespace "$NAMESPACE" || true
-        echo_success "Helm release and namespace deleted"
+        echo_warning "This script only manages the KIND cluster."
+        echo_info "For Helm deployment cleanup, use: ./install-helm-chart.sh cleanup"
         echo_info "To delete the entire cluster, run: $0 cleanup --all"
     fi
 }
 
 # Main execution
 main() {
-    echo_info "ROS-OCP Kubernetes Deployment for KIND"
-    echo_info "======================================="
+    echo_info "ROS-OCP KIND Cluster Setup"
+    echo_info "=========================="
+    echo_info "This script sets up a KIND cluster for ROS-OCP deployment."
+    echo_info "For Helm chart deployment, use: ./install-helm-chart.sh"
+    echo ""
 
     # Check prerequisites
     if ! check_prerequisites; then
@@ -498,9 +379,6 @@ main() {
 
     echo_info "Configuration:"
     echo_info "  KIND Cluster: $KIND_CLUSTER_NAME"
-    echo_info "  Helm Release: $HELM_RELEASE_NAME"
-    echo_info "  Namespace: $NAMESPACE"
-    echo_info "  Storage Class: $STORAGE_CLASS"
     echo ""
 
     # Create KIND cluster
@@ -518,37 +396,16 @@ main() {
         exit 1
     fi
 
-    # Create namespace
-    if ! create_namespace; then
-        exit 1
-    fi
-
-    # Deploy Helm chart
-    if ! deploy_helm_chart; then
-        exit 1
-    fi
-
-    # Wait for pods to be ready
-    if ! wait_for_pods; then
-        echo_warning "Some pods may not be ready. Continuing..."
-    fi
-
-    # Create NodePort services
-    if ! create_nodeport_services; then
-        echo_warning "Failed to create NodePort services. You may need to use port-forwarding."
-    fi
-
-    # Show deployment status
+    # Show cluster status
     show_status
 
-    # Run health checks
-    echo_info "Waiting 30 seconds for services to stabilize before running health checks..."
-    sleep 30
-    run_health_checks
-
     echo ""
-    echo_success "ROS-OCP deployment completed!"
-    echo_info "The services are now running in KIND cluster '$KIND_CLUSTER_NAME'"
+    echo_success "KIND cluster setup completed!"
+    echo_info "The cluster '$KIND_CLUSTER_NAME' is now ready for Helm chart deployment"
+    echo_info ""
+    echo_info "Next Steps:"
+    echo_info "  1. Deploy ROS-OCP Helm chart: ./install-helm-chart.sh"
+    echo_info "  2. Test the deployment: ./test-k8s-dataflow.sh"
 }
 
 # Handle script arguments
@@ -561,30 +418,29 @@ case "${1:-}" in
         show_status
         exit 0
         ;;
-    "health")
-        run_health_checks
-        exit $?
-        ;;
     "help"|"-h"|"--help")
         echo "Usage: $0 [command]"
         echo ""
         echo "Commands:"
-        echo "  (none)          - Deploy ROS-OCP to KIND cluster"
-        echo "  cleanup         - Delete Helm release and namespace"
+        echo "  (none)          - Setup KIND cluster for ROS-OCP"
         echo "  cleanup --all   - Delete entire KIND cluster"
-        echo "  status          - Show deployment status"
-        echo "  health          - Run health checks"
+        echo "  status          - Show cluster status"
         echo "  help            - Show this help message"
         echo ""
         echo "Environment Variables:"
         echo "  KIND_CLUSTER_NAME - Name of KIND cluster (default: ros-ocp-cluster)"
-        echo "  HELM_RELEASE_NAME - Name of Helm release (default: ros-ocp)"
-        echo "  NAMESPACE         - Kubernetes namespace (default: ros-ocp)"
-        echo "  STORAGE_CLASS     - Storage class name (default: standard)"
         echo ""
         echo "Requirements:"
         echo "  - Docker must be running (default container runtime)"
-        echo "  - kubectl, helm, and kind must be installed"
+        echo "  - kubectl and kind must be installed"
+        echo "  - Docker Desktop: Minimum 6GB memory allocation"
+        echo ""
+        echo "Two-Step Deployment:"
+        echo "  1. ./deploy-kind.sh       - Setup KIND cluster"
+        echo "  2. ./install-helm-chart.sh - Deploy ROS-OCP Helm chart"
+        echo ""
+        echo "Next Steps:"
+        echo "  After successful setup, run ./install-helm-chart.sh to deploy ROS-OCP"
         exit 0
         ;;
 esac
